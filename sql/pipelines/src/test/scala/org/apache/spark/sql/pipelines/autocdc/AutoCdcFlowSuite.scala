@@ -19,13 +19,17 @@ package org.apache.spark.sql.pipelines.autocdc
 
 import java.util.Locale
 
+import org.scalatest.BeforeAndAfterEach
+
 import scala.util.Success
 
 import org.apache.spark.sql.{functions => F, AnalysisException, Column, QueryTest}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.classic.DataFrame
+import org.apache.spark.sql.connector.catalog.SharedTablesInMemoryRowLevelOperationTableCatalog
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.pipelines.graph.{
+  AutoCdcAuxiliaryTable,
   AutoCdcFlow,
   AutoCdcMergeFlow,
   FlowFunction,
@@ -41,9 +45,32 @@ import org.apache.spark.sql.types.{DataType, IntegerType, LongType, StringType, 
  * Unit tests for the [[AutoCdcFlow]] and [[AutoCdcMergeFlow]] that do not execute graph analysis
  * or execution.
  */
-class AutoCdcFlowSuite extends QueryTest with SharedSparkSession {
+class AutoCdcFlowSuite extends QueryTest with SharedSparkSession with BeforeAndAfterEach {
 
   private val testIdentifier = TableIdentifier("cdc_target", Some("db"))
+
+  // V2 catalog used by drift-validation tests below to pre-create an auxiliary table that the
+  // [[AutoCdcMergeFlow]] constructor will read at construction time. Keep separate from the
+  // default `testIdentifier` (which has no catalog) so non-drift tests don't need the catalog
+  // setup.
+  private val driftTestCatalog: String = "cat"
+  private val driftTestNamespace: String = "ns1"
+
+  override protected def beforeEach(): Unit = {
+    super.beforeEach()
+    spark.conf.set(
+      s"spark.sql.catalog.$driftTestCatalog",
+      classOf[SharedTablesInMemoryRowLevelOperationTableCatalog].getName
+    )
+    spark.sql(s"CREATE NAMESPACE IF NOT EXISTS $driftTestCatalog.$driftTestNamespace")
+  }
+
+  override protected def afterEach(): Unit = {
+    SharedTablesInMemoryRowLevelOperationTableCatalog.reset()
+    spark.sessionState.catalogManager.reset()
+    spark.sessionState.conf.unsetConf(s"spark.sql.catalog.$driftTestCatalog")
+    super.afterEach()
+  }
 
   /** A no-op [[FlowFunction]] that throws if invoked; AutoCdcFlow tests should never call it. */
   private val noOpFlowFunction: FlowFunction = new FlowFunction {
@@ -595,6 +622,302 @@ class AutoCdcFlowSuite extends QueryTest with SharedSparkSession {
       parameters = Map(
         "caseSensitivity" -> CaseSensitivityLabels.CaseInsensitive,
         "keyColumnName" -> "id"
+      )
+    )
+  }
+
+  // ===========================================================================================
+  // AutoCdcMergeFlow KEY_SCHEMA_DRIFT validation tests
+  // ===========================================================================================
+
+  /** DDL fragment for the AutoCDC metadata column appended to every SCD1 auxiliary table. */
+  private val cdcMetadataDdl: String = {
+    val col = Scd1BatchProcessor.cdcMetadataColName
+    val del = Scd1BatchProcessor.cdcDeleteSequenceFieldName
+    val ups = Scd1BatchProcessor.cdcUpsertSequenceFieldName
+    s"$col STRUCT<$del:BIGINT,$ups:BIGINT> NOT NULL"
+  }
+
+  /** Fully-qualified destination identifier under the test V2 catalog/namespace. */
+  private def driftTargetIdent(name: String): TableIdentifier =
+    TableIdentifier(name, Some(driftTestNamespace), Some(driftTestCatalog))
+
+  /**
+   * Pre-create the auxiliary table for a drift test. `keysDdl` is the keys-first portion of the
+   * aux schema (e.g. `"id INT NOT NULL"`); the CDC metadata column is appended automatically.
+   * `numKeyColumnsProperty` controls the [[AutoCdcAuxiliaryTable.numKeyColumnsProperty]] value:
+   *   - `Some(value)` writes the property as `value` (use the int's string form for healthy
+   *     tables and a non-int string to simulate a malformed property).
+   *   - `None` omits the table property entirely to simulate a corrupt aux table.
+   */
+  private def createAuxTableForDriftTest(
+      targetName: String,
+      keysDdl: String,
+      numKeyColumnsProperty: Option[String]): TableIdentifier = {
+    val auxIdent = AutoCdcAuxiliaryTable.identifier(driftTargetIdent(targetName))
+    val tblPropsClause = numKeyColumnsProperty match {
+      case Some(value) =>
+        s"TBLPROPERTIES ('${AutoCdcAuxiliaryTable.numKeyColumnsProperty}' = '$value')"
+      case None => ""
+    }
+    spark.sql(
+      s"CREATE TABLE ${auxIdent.unquotedString} ($keysDdl, $cdcMetadataDdl) $tblPropsClause"
+    )
+    auxIdent
+  }
+
+  /**
+   * Construct an [[AutoCdcMergeFlow]] targeting the given destination identifier, with the
+   * supplied keys and source df. Mirrors [[newAutoCdcMergeFlow]] but parameterizes destination
+   * so drift tests can point at an aux table they pre-created in the V2 test catalog.
+   */
+  private def newAutoCdcMergeFlowAt(
+      destination: TableIdentifier,
+      sourceDf: DataFrame,
+      keys: Seq[UnqualifiedColumnName],
+      sequencing: Column = F.col("version")): AutoCdcMergeFlow = {
+    val flow = newAutoCdcFlow(
+      identifier = destination,
+      destinationIdentifier = destination,
+      changeArgs = ChangeArgs(
+        keys = keys,
+        sequencing = sequencing,
+        storedAsScdType = ScdType.Type1
+      )
+    )
+    new AutoCdcMergeFlow(flow, successfulFuncResult(sourceDf))
+  }
+
+  /** Build an empty source df with the given top-level fields plus a `version BIGINT` column. */
+  private def driftSourceDf(fields: StructField*): DataFrame = {
+    val schema = fields.foldLeft(new StructType()) { case (acc, f) => acc.add(f) }
+      .add("version", LongType, nullable = false)
+    spark.createDataFrame(spark.sparkContext.emptyRDD[org.apache.spark.sql.Row], schema)
+  }
+
+  test("AutoCdcMergeFlow rejects expanding the key set vs the recorded auxiliary keys") {
+    // Aux table was created with a single key column `id`; the flow now declares two keys
+    // [region, id] - key arity drift -> KEY_SCHEMA_DRIFT.
+    val targetName = "target"
+    val auxIdent = createAuxTableForDriftTest(
+      targetName = targetName,
+      keysDdl = "id INT NOT NULL",
+      numKeyColumnsProperty = Some("1")
+    )
+    val sourceDf = driftSourceDf(
+      StructField("region", StringType),
+      StructField("id", IntegerType, nullable = false)
+    )
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        newAutoCdcMergeFlowAt(
+          destination = driftTargetIdent(targetName),
+          sourceDf = sourceDf,
+          keys = Seq(UnqualifiedColumnName("region"), UnqualifiedColumnName("id"))
+        )
+      },
+      condition = "AUTOCDC_INVALID_STATE.KEY_SCHEMA_DRIFT",
+      sqlState = "42000",
+      parameters = Map(
+        "flowName" -> driftTargetIdent(targetName).unquotedString,
+        "auxTableName" -> auxIdent.unquotedString,
+        "expectedKeySchema" -> "region STRING,id INT NOT NULL",
+        "recordedKeySchema" -> "id INT NOT NULL"
+      )
+    )
+  }
+
+  test("AutoCdcMergeFlow rejects shrinking the key set vs the recorded auxiliary keys") {
+    // Aux table was created with two keys [region, id]; the flow now declares only [id] - key
+    // arity drift -> KEY_SCHEMA_DRIFT. Without strict-equality, `id` would silently match at
+    // position 0 of the existing aux schema and the dropped `region` key would slip through.
+    val targetName = "target"
+    val auxIdent = createAuxTableForDriftTest(
+      targetName = targetName,
+      keysDdl = "region STRING NOT NULL, id INT NOT NULL",
+      numKeyColumnsProperty = Some("2")
+    )
+    val sourceDf = driftSourceDf(
+      StructField("region", StringType, nullable = false),
+      StructField("id", IntegerType, nullable = false)
+    )
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        newAutoCdcMergeFlowAt(
+          destination = driftTargetIdent(targetName),
+          sourceDf = sourceDf,
+          keys = Seq(UnqualifiedColumnName("id"))
+        )
+      },
+      condition = "AUTOCDC_INVALID_STATE.KEY_SCHEMA_DRIFT",
+      sqlState = "42000",
+      parameters = Map(
+        "flowName" -> driftTargetIdent(targetName).unquotedString,
+        "auxTableName" -> auxIdent.unquotedString,
+        "expectedKeySchema" -> "id INT NOT NULL",
+        "recordedKeySchema" -> "region STRING NOT NULL,id INT NOT NULL"
+      )
+    )
+  }
+
+  test("AutoCdcMergeFlow rejects swapping a key column for a different one of the same arity") {
+    // Aux table records keys [id, region]; the flow now declares [id, country]. Same arity but
+    // the second key column's name diverges per-position -> KEY_SCHEMA_DRIFT. This exercises
+    // the per-position name comparison that an arity-only check would miss.
+    val targetName = "target"
+    val auxIdent = createAuxTableForDriftTest(
+      targetName = targetName,
+      keysDdl = "id INT NOT NULL, region STRING",
+      numKeyColumnsProperty = Some("2")
+    )
+    val sourceDf = driftSourceDf(
+      StructField("id", IntegerType, nullable = false),
+      StructField("region", StringType),
+      StructField("country", StringType)
+    )
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        newAutoCdcMergeFlowAt(
+          destination = driftTargetIdent(targetName),
+          sourceDf = sourceDf,
+          keys = Seq(UnqualifiedColumnName("id"), UnqualifiedColumnName("country"))
+        )
+      },
+      condition = "AUTOCDC_INVALID_STATE.KEY_SCHEMA_DRIFT",
+      sqlState = "42000",
+      parameters = Map(
+        "flowName" -> driftTargetIdent(targetName).unquotedString,
+        "auxTableName" -> auxIdent.unquotedString,
+        "expectedKeySchema" -> "id INT NOT NULL,country STRING",
+        "recordedKeySchema" -> "id INT NOT NULL,region STRING"
+      )
+    )
+  }
+
+  test("AutoCdcMergeFlow rejects a same-named key whose dataType differs from the recorded key") {
+    // Aux table recorded key `id INT NOT NULL`; the flow's source df now exposes `id BIGINT
+    // NOT NULL`. Per-position name and arity both line up but dataType comparison fails.
+    val targetName = "target"
+    val auxIdent = createAuxTableForDriftTest(
+      targetName = targetName,
+      keysDdl = "id INT NOT NULL",
+      numKeyColumnsProperty = Some("1")
+    )
+    val sourceDf = driftSourceDf(
+      StructField("id", LongType, nullable = false)
+    )
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        newAutoCdcMergeFlowAt(
+          destination = driftTargetIdent(targetName),
+          sourceDf = sourceDf,
+          keys = Seq(UnqualifiedColumnName("id"))
+        )
+      },
+      condition = "AUTOCDC_INVALID_STATE.KEY_SCHEMA_DRIFT",
+      sqlState = "42000",
+      parameters = Map(
+        "flowName" -> driftTargetIdent(targetName).unquotedString,
+        "auxTableName" -> auxIdent.unquotedString,
+        "expectedKeySchema" -> "id BIGINT NOT NULL",
+        "recordedKeySchema" -> "id INT NOT NULL"
+      )
+    )
+  }
+
+  test("AutoCdcMergeFlow rejects a composite key reorder ([a,b] -> [b,a])") {
+    // Aux table positionally recorded keys [a, b]; the flow now declares the same key set but
+    // reordered to [b, a]. Same arity, same set of names, but per-position equality fails.
+    val targetName = "target"
+    val auxIdent = createAuxTableForDriftTest(
+      targetName = targetName,
+      keysDdl = "a INT NOT NULL, b STRING NOT NULL",
+      numKeyColumnsProperty = Some("2")
+    )
+    val sourceDf = driftSourceDf(
+      StructField("a", IntegerType, nullable = false),
+      StructField("b", StringType, nullable = false)
+    )
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        newAutoCdcMergeFlowAt(
+          destination = driftTargetIdent(targetName),
+          sourceDf = sourceDf,
+          keys = Seq(UnqualifiedColumnName("b"), UnqualifiedColumnName("a"))
+        )
+      },
+      condition = "AUTOCDC_INVALID_STATE.KEY_SCHEMA_DRIFT",
+      sqlState = "42000",
+      parameters = Map(
+        "flowName" -> driftTargetIdent(targetName).unquotedString,
+        "auxTableName" -> auxIdent.unquotedString,
+        "expectedKeySchema" -> "b STRING NOT NULL,a INT NOT NULL",
+        "recordedKeySchema" -> "a INT NOT NULL,b STRING NOT NULL"
+      )
+    )
+  }
+
+  test("AutoCdcMergeFlow surfaces INTERNAL_ERROR when the auxiliary table is missing the " +
+    "numKeyColumns property") {
+    // Pre-create an aux table without the `numKeyColumns` property to simulate corrupt internal
+    // state (e.g. a stale aux written by an older code path). The flow constructor must surface
+    // INTERNAL_ERROR rather than silently mis-validating keys against an unknown count.
+    val targetName = "target"
+    val auxIdent = createAuxTableForDriftTest(
+      targetName = targetName,
+      keysDdl = "id INT NOT NULL",
+      numKeyColumnsProperty = None
+    )
+    val sourceDf = driftSourceDf(StructField("id", IntegerType, nullable = false))
+
+    checkError(
+      exception = intercept[org.apache.spark.SparkException] {
+        newAutoCdcMergeFlowAt(
+          destination = driftTargetIdent(targetName),
+          sourceDf = sourceDf,
+          keys = Seq(UnqualifiedColumnName("id"))
+        )
+      },
+      condition = "INTERNAL_ERROR",
+      parameters = Map(
+        "message" ->
+          (s"Auxiliary table ${auxIdent.quotedString} is missing the " +
+            s"${AutoCdcAuxiliaryTable.numKeyColumnsProperty} table property; cannot validate " +
+            s"AutoCDC key columns. Full-refresh the target table to recreate the auxiliary table.")
+      )
+    )
+  }
+
+  test("AutoCdcMergeFlow surfaces INTERNAL_ERROR when the auxiliary table's numKeyColumns " +
+    "property is malformed") {
+    // Non-integer `numKeyColumns` property simulates corrupt internal state. The flow
+    // constructor must surface INTERNAL_ERROR rather than letting NumberFormatException leak.
+    val targetName = "target"
+    val auxIdent = createAuxTableForDriftTest(
+      targetName = targetName,
+      keysDdl = "id INT NOT NULL",
+      numKeyColumnsProperty = Some("not-an-int")
+    )
+    val sourceDf = driftSourceDf(StructField("id", IntegerType, nullable = false))
+
+    checkError(
+      exception = intercept[org.apache.spark.SparkException] {
+        newAutoCdcMergeFlowAt(
+          destination = driftTargetIdent(targetName),
+          sourceDf = sourceDf,
+          keys = Seq(UnqualifiedColumnName("id"))
+        )
+      },
+      condition = "INTERNAL_ERROR",
+      parameters = Map(
+        "message" ->
+          (s"Auxiliary table ${auxIdent.quotedString} has a malformed " +
+            s"${AutoCdcAuxiliaryTable.numKeyColumnsProperty} property: 'not-an-int'.")
       )
     )
   }

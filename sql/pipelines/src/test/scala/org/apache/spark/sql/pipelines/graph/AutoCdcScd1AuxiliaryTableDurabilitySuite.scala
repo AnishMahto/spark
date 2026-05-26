@@ -158,6 +158,7 @@ class AutoCdcScd1AuxiliaryTableDurabilitySuite
     // The auxiliary table only contains keys and the metadata column, hence "name" should not be
     // included.
     assert(auxSchema.fieldNames.toSeq == Seq("id", Scd1BatchProcessor.cdcMetadataColName))
+    assert(getAuxTableNumKeyColumns(target = "target") == 1)
   }
 
   test("the auxiliary table preserves the user's declared key order, independent of the " +
@@ -194,6 +195,7 @@ class AutoCdcScd1AuxiliaryTableDurabilitySuite
     val auxSchema = spark.table(auxTableNameFor("target")).schema
     assert(auxSchema.fieldNames.toSeq ==
       Seq("region", "id", Scd1BatchProcessor.cdcMetadataColName))
+    assert(getAuxTableNumKeyColumns(target = "target") == 2)
   }
 
   test("if the AutoCDC auxiliary table is dropped between runs, it is transparently " +
@@ -238,4 +240,15 @@ class AutoCdcScd1AuxiliaryTableDurabilitySuite
     )
   }
 
+  private def getAuxTableNumKeyColumns(target: String): Int = {
+    val auxName = auxTableNameFor(target)
+    val rows = spark.sql(s"SHOW TBLPROPERTIES $auxName").collect()
+    val prop = rows
+      .find(_.getString(0) == AutoCdcAuxiliaryTable.numKeyColumnsProperty)
+      .getOrElse(throw new AssertionError(
+        s"auxiliary table $auxName is missing the " +
+        s"${AutoCdcAuxiliaryTable.numKeyColumnsProperty} property; got: ${rows.toSeq}"
+      ))
+    prop.getString(1).toInt
+  }
 }
