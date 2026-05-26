@@ -255,13 +255,11 @@ class AutoCdcMergeFlow(
     val flow: AutoCdcFlow,
     val funcResult: FlowFunctionResult
 ) extends ResolvedFlow {
-  // Construction-time validations are ordered so each one's preconditions are satisfied by the
-  // earlier ones: reserved-prefix inspects `df.schema` directly, `userSelectedSchema`'s
-  // initializer enforces `requireKeysPresentInSelectedSchema`, and key-schema-drift then reads
-  // the validated `userSelectedSchema` to derive its expected key set.
-  requireReservedPrefixAbsentInSourceColumns()
 
   def changeArgs: ChangeArgs = flow.changeArgs
+
+  // Verify that no columns in the flow's source df contain the reserved autocdc prefix.
+  requireReservedPrefixAbsentInSourceColumns()
 
   /** The user-selected projection of [[df.schema]] (i.e. before the SCD metadata column). */
   private val userSelectedSchema: StructType = {
@@ -277,6 +275,8 @@ class AutoCdcMergeFlow(
     selectedSchema
   }
 
+  // If the auxiliary table corresponding to the target already exists, verify the user is trigging
+  // an AutoCDC transformation to that target using the same keys.
   validateNoAutoCdcKeyDriftIfAuxTableExists()
 
   /** The DataType of the sequencing expression, derived once from the source change feed. */
