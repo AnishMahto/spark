@@ -36,11 +36,6 @@ import org.apache.spark.sql.test.SharedSparkSession
  * array-of-struct, broadening / narrowing column selection) and the cases that fail loudly
  * today (subtractive nested evolution, type-incompatible changes, case-only renames).
  *
- * Key-schema drift is validated separately at graph-resolution time inside
- * [[org.apache.spark.sql.pipelines.graph.AutoCdcMergeFlow]] and is unit-tested in
- * [[org.apache.spark.sql.pipelines.autocdc.AutoCdcFlowSuite]]; an end-to-end demonstration of
- * cross-pipeline drift detection lives in [[AutoCdcScd1MultiPipelineSuite]].
- *
  * These behaviors are largely inherited from the lower layers (`SchemaMergingUtils` for
  * schema merge, the v2 writer's column-resolution layer for nested-field handling) rather
  * than implemented in AutoCDC itself; the tests here serve as the contract for AutoCDC's
