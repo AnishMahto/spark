@@ -404,9 +404,9 @@ class AutoCdcMergeFlow(
   }
 
   /**
-   * Validate that the AutoCDC key columns the flow expects exactly match the keys recorded
-   * in the existing auxiliary table at [[auxIdent]]: same number of key columns, same names
-   * (per the session resolver), same `dataType`s.
+   * Validate that the AutoCDC key columns the flow expects match the keys recorded in the
+   * existing auxiliary table at [[auxIdent]] as a set: same arity, same set of names (per the
+   * session resolver), same per-name `dataType`s.
    */
   private def validateNoAutoCdcKeyDrift(
       existingAuxTable: org.apache.spark.sql.connector.catalog.Table,
@@ -414,35 +414,52 @@ class AutoCdcMergeFlow(
     val existingAuxSchema = CatalogV2Util.v2ColumnsToStructType(existingAuxTable.columns())
     val resolver = spark.sessionState.conf.resolver
 
-    val expectedKeySchema = StructType(
-      changeArgs.keys.map { key =>
-        userSelectedSchema.fields
-          .find(field => resolver(field.name, key.name))
-          .getOrElse(
-            // Construction of [[userSelectedSchema]] already enforces all of the user-specified
-            // keys are indeed in the selected schema, so if we don't find a key it is truly an
-            // internal error.
-            throw SparkException.internalError(
-              s"Key column '${key.name}' was not found in the AutoCDC flow's selected schema."
-            )
+    val expectedKeyFields: Seq[StructField] = changeArgs.keys.map { key =>
+      userSelectedSchema.fields
+        .find(field => resolver(field.name, key.name))
+        .getOrElse(
+          // Construction of [[userSelectedSchema]] already enforces all of the user-specified
+          // keys are indeed in the selected schema, so if we don't find a key it is truly an
+          // internal error.
+          throw SparkException.internalError(
+            s"Key column '${key.name}' was not found in the AutoCDC flow's selected schema."
           )
-      }
-    )
+        )
+    }
+    val expectedKeySchema = StructType(expectedKeyFields)
 
-    val numRecordedKeys = parseRecordedNumKeyColumns(existingAuxTable, auxIdent)
-    val recordedKeyFields = existingAuxSchema.fields.take(numRecordedKeys)
+    val recordedKeyNames = parseRecordedKeyColumnNames(existingAuxTable, auxIdent)
+    val recordedKeyFields: Seq[StructField] = recordedKeyNames.map { name =>
+      existingAuxSchema.fields
+        .find(field => resolver(field.name, name))
+        .getOrElse(
+          // Either an implementation bug or, more likely, the user has corrupted the auxiliary
+          // table schema (e.g. dropped the key column). The remedy is full-refresh in either case.
+          throw new SparkException(
+            errorClass = "AUTOCDC_INVALID_STATE.AUXILIARY_TABLE_KEY_COLUMN_MISSING",
+            messageParameters = Map(
+              "flowName" -> flow.identifier.unquotedString,
+              "auxTableName" -> auxIdent.unquotedString,
+              "keyColumnName" -> name,
+              "propertyName" -> AutoCdcAuxiliaryTable.keyColumnNamesProperty
+            ),
+            cause = null
+          )
+        )
+    }
+
     val drifted =
-      // The key count persisted to table properties should match against the number of keys in the
-      // current pipeline execution's expected aux table schema.
+      // Arity drift (added or dropped keys).
       recordedKeyFields.length != expectedKeySchema.length ||
-      // The number of keys in the existing aux table schema should be no less than what was
-      // recorded in the aux table's properties.
-      recordedKeyFields.length != numRecordedKeys ||
-      // Each key in the existing aux table schema should should also exist in the current pipeline
-      // execution's expected aux table schema.
-      recordedKeyFields.zip(expectedKeySchema.fields).exists { case (recorded, expected) =>
-        !resolver(recorded.name, expected.name) ||
-        recorded.dataType != expected.dataType
+      // Name or dataType drift: every expected key must have a same-name (resolver-aware)
+      // recorded counterpart with a matching dataType. An expected name that is absent from
+      // the recorded set indicates the key set has changed; a same-name recorded counterpart
+      // with a different dataType indicates a key dataType change.
+      expectedKeyFields.exists { expected =>
+        recordedKeyFields.find(rf => resolver(rf.name, expected.name)) match {
+          case None => true
+          case Some(recorded) => recorded.dataType != expected.dataType
+        }
       }
 
     if (drifted) {
@@ -459,30 +476,36 @@ class AutoCdcMergeFlow(
   }
 
   /**
-   * Read the integer [[AutoCdcAuxiliaryTable.numKeyColumnsProperty]] off an existing auxiliary
-   * table. Both "missing property" and "non-integer value" indicate corrupt internal state and
-   * surface as `internalError`s; the property is written by AutoCDC's auxiliary-table creation
-   * path on first run and is not expected to be missing or malformed on a healthy auxiliary
-   * table.
+   * Read the [[AutoCdcAuxiliaryTable.keyColumnNamesProperty]] off an existing auxiliary table
+   * and parse it into the ordered list of recorded AutoCDC key column names.
    */
-  private def parseRecordedNumKeyColumns(
+  private def parseRecordedKeyColumnNames(
       existingAuxTable: org.apache.spark.sql.connector.catalog.Table,
-      auxIdent: TableIdentifier): Int = {
-    val rawNumKeyColumns = Option(
-      existingAuxTable.properties().get(AutoCdcAuxiliaryTable.numKeyColumnsProperty)
+      auxIdent: TableIdentifier): Seq[String] = {
+    val rawValue = Option(
+      existingAuxTable.properties().get(AutoCdcAuxiliaryTable.keyColumnNamesProperty)
     ).getOrElse {
-      throw SparkException.internalError(
-        s"Auxiliary table ${auxIdent.quotedString} is missing the " +
-        s"${AutoCdcAuxiliaryTable.numKeyColumnsProperty} table property; cannot validate " +
-        s"AutoCDC key columns. Full-refresh the target table to recreate the auxiliary table."
+      throw new SparkException(
+        errorClass = "AUTOCDC_INVALID_STATE.AUXILIARY_TABLE_PROPERTY_MISSING",
+        messageParameters = Map(
+          "flowName" -> flow.identifier.unquotedString,
+          "auxTableName" -> auxIdent.unquotedString,
+          "propertyName" -> AutoCdcAuxiliaryTable.keyColumnNamesProperty
+        ),
+        cause = null
       )
     }
-    try rawNumKeyColumns.toInt catch {
-      case _: NumberFormatException =>
-        throw SparkException.internalError(
-          s"Auxiliary table ${auxIdent.quotedString} has a malformed " +
-          s"${AutoCdcAuxiliaryTable.numKeyColumnsProperty} property: '$rawNumKeyColumns'."
-        )
+    AutoCdcAuxiliaryTable.parseKeyColumnNames(rawValue).getOrElse {
+      throw new SparkException(
+        errorClass = "AUTOCDC_INVALID_STATE.AUXILIARY_TABLE_PROPERTY_MALFORMED",
+        messageParameters = Map(
+          "flowName" -> flow.identifier.unquotedString,
+          "auxTableName" -> auxIdent.unquotedString,
+          "propertyName" -> AutoCdcAuxiliaryTable.keyColumnNamesProperty,
+          "rawValue" -> rawValue
+        ),
+        cause = null
+      )
     }
   }
 }
